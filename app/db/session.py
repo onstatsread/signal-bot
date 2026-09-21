@@ -4,8 +4,11 @@ from app.config import DATABASE_URL
 from app.db.models import Base
 
 # Render's Postgres URLs sometimes start with "postgres://" -- SQLAlchemy needs "postgresql://"
-_url = DATABASE_URL.replace("postgres://", "postgresql://", 1) if DATABASE_URL.startswith("postgres://") else DATABASE_URL
-
+_url = DATABASE_URL
+if _url.startswith("postgres://"):
+    _url = _url.replace("postgres://", "postgresql+psycopg://", 1)
+elif _url.startswith("postgresql://"):
+    _url = _url.replace("postgresql://", "postgresql+psycopg://", 1)
 engine = create_engine(_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 

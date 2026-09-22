@@ -37,7 +37,21 @@ def health():
 async def scan(db: Session = Depends(get_session)):
     signal = await run_scan_cycle(db)
     return {"signal_sent": signal is not None, "symbol": signal.symbol if signal else None}
-
+@app.get("/debug/last-scan")
+def debug_last_scan(db: Session = Depends(get_session)):
+    from app.db.models import ScanLog
+    logs = db.query(ScanLog).order_by(ScanLog.scanned_at.desc()).limit(20).all()
+    return [
+        {
+            "symbol": l.symbol,
+            "trend": l.trend,
+            "pattern_found": l.pattern_found,
+            "qualified": l.qualified,
+            "reason_skipped": l.reason_skipped,
+            "scanned_at": l.scanned_at.isoformat() if l.scanned_at else None,
+        }
+        for l in logs
+    ]
 
 @app.post("/check-signals")
 async def check_signals(db: Session = Depends(get_session)):

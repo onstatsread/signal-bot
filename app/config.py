@@ -36,7 +36,7 @@ WATCHLIST = [
 
 # --- Timeframes (Deriv granularity in seconds) ---
 HTF_GRANULARITY = 14400   # 4H -- used for trend + key levels
-LTF_GRANULARITY = 900    # 15min -- used for pattern detection / entries
+LTF_GRANULARITY = 300     # 5min -- used for pattern detection / entries
 CANDLES_TO_FETCH = 200    # how many candles to pull per request (need enough history for swings/MA/Fib)
 
 # --- Strategy constants (from the Candlestick Trading Bible) ---

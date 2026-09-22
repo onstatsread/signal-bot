@@ -7,7 +7,7 @@ import os
 # --- Deriv API ---
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "1089")  # 1089 is Deriv's public demo app_id
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN", "")  # your account's API token (read-only is enough)
-DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+DERIV_WS_URL = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 # --- Telegram ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")

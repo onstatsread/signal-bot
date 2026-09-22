@@ -55,7 +55,11 @@ async def fetch_candles(symbol: str, granularity: int, count: int) -> List[Candl
     Fetch `count` most recent candles for `symbol` at `granularity` seconds
     per candle (e.g. 3600 = 1H, 14400 = 4H).
     """
-    async with websockets.connect(DERIV_WS_URL, ping_interval=20) as ws:
+    async with websockets.connect(
+        DERIV_WS_URL,
+        ping_interval=20,
+        additional_headers={"Origin": "https://signal-bot-eqg8.onrender.com"},
+    ) as ws:
         if DERIV_API_TOKEN:
             await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
             await ws.recv()  # discard authorize response

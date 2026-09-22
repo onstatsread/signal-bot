@@ -88,15 +88,13 @@ async def fetch_candles(symbol: str, granularity: int, count: int) -> List[Candl
 
 
 async def fetch_all(symbols: List[str], granularity: int, count: int) -> dict:
-    """Fetch candles for multiple symbols concurrently. Returns {symbol: [Candle,...]}."""
-    results = await asyncio.gather(
-        *[fetch_candles(s, granularity, count) for s in symbols],
-        return_exceptions=True,
-    )
+    """Fetch candles for multiple symbols ONE AT A TIME (not concurrently) -- keeps
+    memory usage low on Render's free 512MB tier, which was crashing under the
+    old concurrent version."""
     out = {}
-    for symbol, result in zip(symbols, results):
-        if isinstance(result, Exception):
-            print(f"[deriv_client] failed to fetch {symbol}: {result}")
-            continue
-        out[symbol] = result
+    for symbol in symbols:
+        try:
+            out[symbol] = await fetch_candles(symbol, granularity, count)
+        except Exception as e:
+            print(f"[deriv_client] failed to fetch {symbol}: {e}")
     return out

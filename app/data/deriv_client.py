@@ -58,7 +58,7 @@ async def fetch_candles(symbol: str, granularity: int, count: int) -> List[Candl
     async with websockets.connect(
         DERIV_WS_URL,
         ping_interval=20,
-        additional_headers={"Origin": "https://signal-bot-eqg8.onrender.com"},
+        extra_headers={"Origin": "https://signal-bot-eqg8.onrender.com"},
     ) as ws:
         if DERIV_API_TOKEN:
             await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))

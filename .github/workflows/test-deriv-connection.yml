@@ -1,0 +1,17 @@
+name: Test Deriv Connection
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-connection:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install websockets
+        run: pip install websockets
+      - name: Test Deriv WebSocket connection
+        run: python test_deriv.py

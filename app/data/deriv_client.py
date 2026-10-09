@@ -1,19 +1,20 @@
 """
 Deriv WebSocket client -- fetches historical OHLC candles for a symbol.
 
-Deriv's API is free to use for market data with just an app_id (no login
-needed for candles). If DERIV_API_TOKEN is set, we authorize first, which
-is only required if you later want to place trades -- not needed for this
-signal-only bot, but wired in for when you're ready to combine it with
-your execution bot.
+Uses curl_cffi with Chrome impersonation instead of the plain `websockets`
+library. Deriv/Cloudflare was rejecting every connection (HTTP 520) from
+the plain websockets library's non-browser TLS fingerprint -- confirmed
+across 4 different networks (Render, Railway, GitHub Actions, and even
+mobile data via Termux), ruling out IP-based blocking. curl_cffi presents
+a real Chrome TLS/JA3 fingerprint, which should get past that check.
 
 Docs: https://developers.deriv.com/docs/websockets
 """
 import json
 import asyncio
-import websockets
 from dataclasses import dataclass
 from typing import List
+from curl_cffi import AsyncSession
 from app.config import DERIV_WS_URL, DERIV_API_TOKEN
 
 
@@ -53,18 +54,14 @@ class Candle:
 async def fetch_candles(symbol: str, granularity: int, count: int) -> List[Candle]:
     """
     Fetch `count` most recent candles for `symbol` at `granularity` seconds
-    per candle (e.g. 3600 = 1H, 14400 = 4H).
+    per candle (e.g. 3600 = 1H, 14400 = 4H). Uses Chrome-impersonated
+    WebSocket connection to get past Cloudflare's bot-fingerprint check.
     """
-    async with websockets.connect(
-        DERIV_WS_URL,
-        ping_interval=20,
-        extra_headers={
-            "Origin": "https://signal-bot-eqg8.onrender.com",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        },
-    ) as ws:
+    async with AsyncSession() as s:
+        ws = await s.ws_connect(DERIV_WS_URL, impersonate="chrome")
+
         if DERIV_API_TOKEN:
-            await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}))
+            await ws.send(json.dumps({"authorize": DERIV_API_TOKEN}).encode())
             await ws.recv()  # discard authorize response
 
         request = {
@@ -75,8 +72,13 @@ async def fetch_candles(symbol: str, granularity: int, count: int) -> List[Candl
             "style": "candles",
             "granularity": granularity,
         }
-        await ws.send(json.dumps(request))
-        response = json.loads(await ws.recv())
+        await ws.send(json.dumps(request).encode())
+        raw = await ws.recv()
+        # curl_cffi may return (bytes, flags) tuple or just bytes depending on version
+        data = raw[0] if isinstance(raw, tuple) else raw
+        response = json.loads(data)
+
+        await ws.close()
 
         if "error" in response:
             raise RuntimeError(f"Deriv API error for {symbol}: {response['error']['message']}")
@@ -95,9 +97,8 @@ async def fetch_candles(symbol: str, granularity: int, count: int) -> List[Candl
 
 
 async def fetch_all(symbols: List[str], granularity: int, count: int) -> dict:
-    """Fetch candles for multiple symbols ONE AT A TIME (not concurrently) -- keeps
-    memory usage low on Render's free 512MB tier, which was crashing under the
-    old concurrent version."""
+    """Fetch candles for multiple symbols ONE AT A TIME (not concurrently) --
+    keeps memory usage low and avoids hammering the connection."""
     out = {}
     for symbol in symbols:
         try:

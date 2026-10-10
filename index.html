@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Candlestick Signal Bot</title>
+<link rel="manifest" href="manifest.json">
+<style>
+  body { background:#0b0f14; color:#d7e0ea; font-family: -apple-system, Roboto, sans-serif; margin:0; padding:16px; }
+  h1 { font-size:18px; color:#5fd0ff; }
+  .status { padding:10px; border-radius:8px; margin-bottom:12px; font-size:14px; }
+  .status.running { background:#113322; color:#6ee7a0; }
+  .status.stopped { background:#331111; color:#ff8a8a; }
+  button { background:#1a73e8; color:white; border:none; padding:12px 20px; border-radius:8px; font-size:16px; width:100%; margin-bottom:8px; }
+  button.stop { background:#c0392b; }
+  #log { background:#000; padding:10px; border-radius:8px; height:60vh; overflow-y:auto; font-family:monospace; font-size:12px; white-space:pre-wrap; }
+  .line-signal { color:#6ee7a0; }
+  .line-error { color:#ff8a8a; }
+  .line-info { color:#9db4c9; }
+</style>
+</head>
+<body>
+<h1>📈 Candlestick Signal Bot</h1>
+<div id="statusBox" class="status stopped">Stopped</div>
+<button id="startBtn">Start</button>
+<button id="stopBtn" class="stop" style="display:none;">Stop</button>
+<div id="log"></div>
+
+<audio id="keepAliveAudio" loop>
+  <source src="data:audio/mp3;base64,//uQxAAAAAAAAAAAAAAAAAAAAAAAWGluZwAAAA8AAAACAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwP/////////////////////////////////////8AAAA5TEFNRTMuMTAwBK8AAAAAAAAAABSAJAJAQgAAgAAAASA0kkqfQAAAAAAAAAAAAAAAAAAAAA" type="audio/mpeg">
+</audio>
+
+<script>
+const CONFIG = {
+  DERIV_APP_ID: localStorage.getItem('DERIV_APP_ID') || '34tmw8hqr2IjqrVCumH9L',
+  TELEGRAM_BOT_TOKEN: localStorage.getItem('TELEGRAM_BOT_TOKEN') || '',
+  TELEGRAM_CHAT_ID: localStorage.getItem('TELEGRAM_CHAT_ID') || '',
+  WATCHLIST: ['frxEURUSD','frxGBPUSD','frxEURGBP','frxUSDJPY','frxAUDUSD','R_10','R_25','R_50','R_75','R_100'],
+  HTF_GRANULARITY: 14400,
+  LTF_GRANULARITY: 900,
+  CANDLES_TO_FETCH: 200,
+  MA_FAST: 8,
+  MA_SLOW: 21,
+  FIB_LEVELS: [0.5, 0.618],
+  FIB_TOLERANCE: 0.003,
+  LEVEL_TOLERANCE: 0.0015,
+  MIN_RR: 2.0,
+  SWING_LOOKBACK: 5,
+};
+
+function log(msg, cls) {
+  const el = document.getElementById('log');
+  const line = document.createElement('div');
+  if (cls) line.className = 'line-' + cls;
+  line.textContent = `[${new Date().toISOString().slice(11,19)}] ${msg}`;
+  el.appendChild(line);
+  el.scrollTop = el.scrollHeight;
+}
+
+function fetchCandles(symbol, granularity, count) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${CONFIG.DERIV_APP_ID}`);
+    const timeout = setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 15000);
+
+    ws.onopen = () => {
+      ws.send(JSON.stringify({
+        ticks_history: symbol, adjust_start_time: 1, count: count,
+        end: 'latest', style: 'candles', granularity: granularity
+      }));
+    };
+    ws.onmessage = (event) => {
+      clearTimeout(timeout);
+      ws.close();
+      try {
+        const data = JSON.parse(event.data);
+        if (data.error) { reject(new Error(data.error.message)); return; }
+        const candles = (data.candles || []).map(c => ({
+          epoch: c.epoch, open: +c.open, high: +c.high, low: +c.low, close: +c.close
+        }));
+        resolve(candles);
+      } catch (e) { reject(e); }
+    };
+    ws.onerror = () => { clearTimeout(timeout); reject(new Error('websocket error')); };
+  });
+}
+
+async function fetchAll(symbols, granularity, count) {
+  const out = {};
+  for (const symbol of symbols) {
+    try {
+      out[symbol] = await fetchCandles(symbol, granularity, count);
+    } catch (e) {
+      log(`failed to fetch ${symbol}: ${e.message}`, 'error');
+    }
+  }
+  return out;
+}
+
+function body(c) { return Math.abs(c.close - c.open); }
+function isBullish(c) { return c.close > c.open; }
+function isBearish(c) { return c.close < c.open; }
+function upperWick(c) { return c.high - Math.max(c.open, c.close); }
+function lowerWick(c) { return Math.min(c.open, c.close) - c.low; }
+
+function findSwingPoints(candles, lookback = CONFIG.SWING_LOOKBACK) {
+  const swings = [];
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    const window = candles.slice(i - lookback, i + lookback + 1);
+    const c = candles[i];
+    if (c.high === Math.max(...window.map(x => x.high))) swings.push({ index: i, price: c.high, kind: 'high' });
+    else if (c.low === Math.min(...window.map(x => x.low))) swings.push({ index: i, price: c.low, kind: 'low' });
+  }
+  return swings;
+}
+
+function hasMinTouches(points, minTouches, tolerance = 0.0015) {
+  if (points.length < minTouches) return false;
+  const avg = points.reduce((s, p) => s + p.price, 0) / points.length;
+  const touches = points.filter(p => Math.abs(p.price - avg) / avg <= tolerance).length;
+  return touches >= minTouches;
+}
+
+function classifyTrend(candles) {
+  const swings = findSwingPoints(candles);
+  const highs = swings.filter(s => s.kind === 'high');
+  const lows = swings.filter(s => s.kind === 'low');
+  if (highs.length < 2 || lows.length < 2) return 'choppy';
+
+  const recentHighs = highs.slice(-3);
+  const recentLows = lows.slice(-3);
+  const rising = arr => arr.every((p, i) => i === 0 || arr[i-1].price < p.price);
+  const falling = arr => arr.every((p, i) => i === 0 || arr[i-1].price > p.price);
+
+  if (rising(recentHighs) && rising(recentLows)) return 'up';
+  if (falling(recentHighs) && falling(recentLows)) return 'down';
+  if (hasMinTouches(recentHighs, 2) && hasMinTouches(recentLows, 2)) return 'range';
+  return 'choppy';
+}
+
+function sma(candles, period) {
+  if (candles.length < period) return null;
+  const closes = candles.slice(-period).map(c => c.close);
+  return closes.reduce((a, b) => a + b, 0) / period;
+}
+
+function nearestSupportResistance(candles, currentPrice) {
+  const swings = findSwingPoints(candles);
+  const supports = swings.filter(s => s.kind === 'low' && s.price < currentPrice).map(s => s.price).sort((a,b) => b-a);
+  const resistances = swings.filter(s => s.kind === 'high' && s.price > currentPrice).map(s => s.price).sort((a,b) => a-b);
+  const hits = [];
+  if (supports.length) hits.push({ kind: 'support', price: supports[0], label: `Support ${supports[0].toFixed(5)}` });
+  if (resistances.length) hits.push({ kind: 'resistance', price: resistances[0], label: `Resistance ${resistances[0].toFixed(5)}` });
+  return hits;
+}
+
+function movingAverageLevels(candles) {
+  const hits = [];
+  const fast = sma(candles, CONFIG.MA_FAST);
+  const slow = sma(candles, CONFIG.MA_SLOW);
+  if (fast) hits.push({ kind: 'ma_fast', price: fast, label: `${CONFIG.MA_FAST} MA ${fast.toFixed(5)}` });
+  if (slow) hits.push({ kind: 'ma_slow', price: slow, label: `${CONFIG.MA_SLOW} MA ${slow.toFixed(5)}` });
+  return hits;
+}
+
+function fibonacciLevels(candles) {
+  const swings = findSwingPoints(candles);
+  if (swings.length < 2) return [];
+  const [p0s, p1s] = swings.slice(-2);
+  const p0 = p0s.price, p1 = p1s.price;
+  const diff = p1 - p0;
+  return CONFIG.FIB_LEVELS.map(level => {
+    const price = p1 - diff * level;
+    const kind = level === 0.5 ? 'fib_50' : 'fib_618';
+    return { kind, price, label: `Fib ${Math.round(level*100)}% ${price.toFixed(5)}` };
+  });
+}
+
+function priceNearLevel(price, level, tolerance) {
+  const tol = tolerance ?? (level.kind.startsWith('fib') ? CONFIG.FIB_TOLERANCE : CONFIG.LEVEL_TOLERANCE);
+  return Math.abs(price - level.price) / level.price <= tol;
+}
+
+function allLevels(candles, currentPrice) {
+  return [...nearestSupportResistance(candles, currentPrice), ...movingAverageLevels(candles), ...fibonacciLevels(candles)];
+}
+
+function detectPinBar(candles) {
+  if (candles.length < 2) return null;
+  const c = candles[candles.length - 2];
+  const b = body(c);
+  if (b === 0) return null;
+  if (lowerWick(c) >= 2*b && upperWick(c) < b) return { strategy:'pin_bar', direction:'BUY', stopLoss:c.low, entryPrice:c.close };
+  if (upperWick(c) >= 2*b && lowerWick(c) < b) return { strategy:'pin_bar', direction:'SELL', stopLoss:c.high, entryPrice:c.close };
+  return null;
+}
+
+function detectEngulfing(candles) {
+  if (candles.length < 3) return null;
+  const prev = candles[candles.length - 3], cur = candles[candles.length - 2];
+  const bullEngulf = isBearish(prev) && isBullish(cur) && cur.close >= prev.open && cur.open <= prev.close;
+  const bearEngulf = isBullish(prev) && isBearish(cur) && cur.open >= prev.close && cur.close <= prev.open;
+  if (bullEngulf) return { strategy:'engulfing', direction:'BUY', stopLoss:Math.min(cur.low, prev.low), entryPrice:cur.close };
+  if (bearEngulf) return { strategy:'engulfing', direction:'SELL', stopLoss:Math.max(cur.high, prev.high), entryPrice:cur.close };
+  return null;
+}
+
+function detectInsideBar(candles) {
+  if (candles.length < 4) return null;
+  const [, mother, baby, breakout] = candles.slice(-4);
+  const isInside = baby.high <= mother.high && baby.low >= mother.low;
+  if (!isInside) return null;
+  if (breakout.close > mother.high) return { strategy:'inside_bar', direction:'BUY', stopLoss:mother.low, entryPrice:breakout.close };
+  if (breakout.close < mother.low) return { strategy:'inside_bar', direction:'SELL', stopLoss:mother.high, entryPrice:breakout.close };
+  return null;
+}
+
+function detectFalseBreakout(candles) {
+  if (candles.length < 4) return null;
+  const [, mother, baby, reversal] = candles.slice(-4);
+  const isInside = baby.high <= mother.high && baby.low >= mother.low;
+  if (!isInside) return null;
+  const brokeUp = reversal.high > mother.high && reversal.close < mother.high;
+  const brokeDown = reversal.low < mother.low && reversal.close > mother.low;
+  if (brokeUp) return { strategy:'false_breakout', direction:'SELL', stopLoss:reversal.high, entryPrice:reversal.close };
+  if (brokeDown) return { strategy:'false_breakout', direction:'BUY', stopLoss:reversal.low, entryPrice:reversal.close };
+  return null;
+}
+
+function detectAllPatterns(candles) {
+  return [detectPinBar, detectEngulfing, detectInsideBar, detectFalseBreakout]
+    .map(fn => fn(candles)).filter(Boolean);
+}
+
+function trendAgrees(trend, direction) {
+  if (trend === 'up') return direction === 'BUY';
+  if (trend === 'down') return direction === 'SELL';
+  if (trend === 'range') return true;
+  return false;
+}
+
+function computeTarget(htfCandles, entry, direction) {
+  const levels = nearestSupportResistance(htfCandles, entry);
+  if (direction === 'BUY') {
+    const resistances = levels.filter(l => l.kind === 'resistance').map(l => l.price);
+    return resistances.length ? Math.min(...resistances) : null;
+  } else {
+    const supports = levels.filter(l => l.kind === 'support').map(l => l.price);
+    return supports.length ? Math.max(...supports) : null;
+  }
+}
+
+function evaluateSymbol(symbol, htfCandles, ltfCandles) {
+  const trend = classifyTrend(htfCandles);
+  if (trend === 'choppy') return null;
+
+  const patterns = detectAllPatterns(ltfCandles);
+  if (!patterns.length) return null;
+
+  const currentPrice = ltfCandles[ltfCandles.length - 1].close;
+  const levels = allLevels(htfCandles, currentPrice);
+
+  let best = null;
+  for (const pattern of patterns) {
+    if (!trendAgrees(trend, pattern.direction)) continue;
+    const matched = levels.filter(lv => priceNearLevel(pattern.entryPrice, lv));
+    if (!matched.length) continue;
+
+    const target = computeTarget(htfCandles, pattern.entryPrice, pattern.direction);
+    if (target === null) continue;
+
+    const risk = Math.abs(pattern.entryPrice - pattern.stopLoss);
+    const reward = Math.abs(target - pattern.entryPrice);
+    if (risk === 0) continue;
+    const rr = reward / risk;
+    if (rr < CONFIG.MIN_RR) continue;
+
+    const score = matched.length * 2 + rr;
+    const setup = {
+      symbol, direction: pattern.direction, strategy: pattern.strategy, trend,
+      entryPrice: pattern.entryPrice, stopLoss: pattern.stopLoss, takeProfit: target,
+      riskReward: Math.round(rr*100)/100, confluenceScore: Math.round(score*100)/100,
+      notes: matched.map(l => l.label).join(' + ')
+    };
+    if (!best || setup.confluenceScore > best.confluenceScore) best = setup;
+  }
+  return best;
+}
+
+function getSignals() { return JSON.parse(localStorage.getItem('signals') || '[]'); }
+function saveSignals(signals) { localStorage.setItem('signals', JSON.stringify(signals)); }
+
+function addSignal(setup) {
+  const signals = getSignals();
+  const signal = { ...setup, id: Date.now(), status: 'OPEN', openedAt: new Date().toISOString() };
+  signals.push(signal);
+  saveSignals(signals);
+  return signal;
+}
+
+function closeSignal(id, status, resultPrice, resultPips) {
+  const signals = getSignals();
+  const sig = signals.find(s => s.id === id);
+  if (sig) {
+    sig.status = status; sig.resultPrice = resultPrice; sig.resultPips = resultPips;
+    sig.closedAt = new Date().toISOString();
+    saveSignals(signals);
+  }
+  return sig;
+}
+
+const STRATEGY_LABELS = { pin_bar:'Pin Bar', engulfing:'Engulfing Bar', inside_bar:'Inside Bar', false_breakout:'Inside Bar False Breakout' };
+
+async function sendTelegram(text) {
+  if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) {
+    log('Telegram not configured: ' + text, 'info');
+    return;
+  }
+  const url = `https://api.telegram.org/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`;
+  try {
+    await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: CONFIG.TELEGRAM_CHAT_ID, text, parse_mode: 'HTML' })
+    });
+  } catch (e) { log('telegram send failed: ' + e.message, 'error'); }
+}
+
+async function sendSignalOpened(signal) {
+  const emoji = signal.direction === 'BUY' ? '🟢' : '🔴';
+  const label = STRATEGY_LABELS[signal.strategy] || signal.strategy;
+  const text = `⭐ <b>BEST SETUP — ${signal.direction}</b> ${emoji}\n${signal.symbol}\n\n`
+    + `Strategy: ${label}\nConfluence: Trend ✅ | Level ✅ | Signal ✅\nLevel: ${signal.notes}\n\n`
+    + `Entry: ${signal.entryPrice.toFixed(5)}\nStop Loss: ${signal.stopLoss.toFixed(5)}\n`
+    + `Take Profit: ${signal.takeProfit.toFixed(5)}\nR:R — 1 : ${signal.riskReward}\n\n`
+    + `Opened: ${new Date(signal.openedAt).toUTCString()}`;
+  await sendTelegram(text);
+}
+
+async function sendSignalClosed(signal) {
+  const won = signal.status === 'WON';
+  const emoji = won ? '✅' : '❌';
+  const label = won ? 'TP HIT' : 'SL HIT';
+  const durationMs = new Date(signal.closedAt) - new Date(signal.openedAt);
+  const hours = Math.floor(durationMs / 3600000);
+  const minutes = Math.floor((durationMs % 3600000) / 60000);
+  const text = `${emoji} <b>${label} — ${signal.symbol} ${signal.direction}</b>\n`
+    + `Entry ${signal.entryPrice.toFixed(5)} → Closed ${signal.resultPrice.toFixed(5)}\n`
+    + `${signal.resultPips >= 0 ? '+' : ''}${signal.resultPips} pips\n\nDuration: ${hours}h ${minutes}m`;
+  await sendTelegram(text);
+}
+
+async function sendSummary(title, sinceMs) {
+  const signals = getSignals();
+  const since = new Date(Date.now() - sinceMs);
+  const closed = signals.filter(s => s.closedAt && new Date(s.closedAt) >= since);
+  const wins = closed.filter(s => s.status === 'WON');
+  const losses = closed.filter(s => s.status === 'LOST');
+  const winRate = closed.length ? (wins.length / closed.length * 100).toFixed(1) : '0.0';
+  const netR = wins.reduce((s, w) => s + w.riskReward, 0) - losses.length;
+  const text = `📊 <b>${title} — ${new Date().toUTCString().slice(0,16)}</b>\n\n`
+    + `Signals: ${closed.length}\n✅ Wins: ${wins.length}\n❌ Losses: ${losses.length}\n`
+    + `Win rate: ${winRate}%\nNet R: ${netR >= 0 ? '+' : ''}${netR.toFixed(1)}R`;
+  await sendTelegram(text);
+}
+
+async function runScanCycle() {
+  const htfData = await fetchAll(CONFIG.WATCHLIST, CONFIG.HTF_GRANULARITY, CONFIG.CANDLES_TO_FETCH);
+  const ltfData = await fetchAll(CONFIG.WATCHLIST, CONFIG.LTF_GRANULARITY, CONFIG.CANDLES_TO_FETCH);
+
+  const candidates = [];
+  for (const symbol of CONFIG.WATCHLIST) {
+    const htf = htfData[symbol], ltf = ltfData[symbol];
+    if (!htf || !ltf) continue;
+    const setup = evaluateSymbol(symbol, htf, ltf);
+    if (setup) candidates.push(setup);
+  }
+
+  if (!candidates.length) { log('no qualifying setup this cycle.', 'info'); return null; }
+
+  const best = candidates.reduce((a, b) => b.confluenceScore > a.confluenceScore ? b : a);
+  const signal = addSignal(best);
+  log(`SIGNAL: ${signal.symbol} ${signal.direction} (${signal.strategy})`, 'signal');
+  await sendSignalOpened(signal);
+  return signal;
+}
+
+async function checkOpenSignals() {
+  const open = getSignals().filter(s => s.status === 'OPEN');
+  if (!open.length) return;
+
+  const symbols = [...new Set(open.map(s => s.symbol))];
+  const cache = {};
+  for (const symbol of symbols) {
+    try { cache[symbol] = await fetchCandles(symbol, CONFIG.LTF_GRANULARITY, CONFIG.CANDLES_TO_FETCH); }
+    catch (e) { log(`check-signals fetch failed for ${symbol}: ${e.message}`, 'error'); }
+  }
+
+  for (const signal of open) {
+    const candles = cache[signal.symbol];
+    if (!candles || candles.length < 2) continue;
+    const c = candles[candles.length - 2];
+    let outcome = null;
+    if (signal.direction === 'BUY') {
+      if (c.close >= signal.takeProfit) outcome = 'WON';
+      else if (c.close <= signal.stopLoss) outcome = 'LOST';
+    } else {
+      if (c.close <= signal.takeProfit) outcome = 'WON';
+      else if (c.close >= signal.stopLoss) outcome = 'LOST';
+    }
+    if (!outcome) continue;
+
+    const pipMult = signal.symbol.startsWith('frx') ? 10000 : 1;
+    let pips = (c.close - signal.entryPrice) * pipMult;
+    if (signal.direction === 'SELL') pips = -pips;
+
+    const closed = closeSignal(signal.id, outcome, c.close, Math.round(pips*10)/10);
+    log(`${outcome}: ${signal.symbol} ${signal.direction} (${pips.toFixed(1)} pips)`, outcome === 'WON' ? 'signal' : 'error');
+    await sendSignalClosed(closed);
+  }
+}
+
+let running = false;
+let wakeLock = null;
+let lastDailySummary = localStorage.getItem('lastDailySummary') || '';
+let lastWeeklySummary = localStorage.getItem('lastWeeklySummary') || '';
+
+async function requestWakeLock() {
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    log('wake lock acquired', 'info');
+    wakeLock.addEventListener('release', () => log('wake lock released', 'error'));
+  } catch (e) { log('wake lock failed: ' + e.message, 'error'); }
+}
+
+document.addEventListener('visibilitychange', async () => {
+  if (running && document.visibilityState === 'visible' && wakeLock === null) {
+    await requestWakeLock();
+  }
+});
+
+async function maybeSendSummaries() {
+  const now = new Date();
+  const today = now.toISOString().slice(0,10);
+  if (now.getUTCHours() === 22 && lastDailySummary !== today) {
+    await sendSummary('DAILY SUMMARY', 24*3600000);
+    lastDailySummary = today;
+    localStorage.setItem('lastDailySummary', today);
+  }
+  const weekKey = `${now.getUTCFullYear()}-W${Math.ceil(now.getUTCDate()/7)}`;
+  if (now.getUTCDay() === 0 && now.getUTCHours() === 22 && lastWeeklySummary !== weekKey) {
+    await sendSummary('WEEKLY SUMMARY', 7*24*3600000);
+    lastWeeklySummary = weekKey;
+    localStorage.setItem('lastWeeklySummary', weekKey);
+  }
+}
+
+async function cycle() {
+  if (!running) return;
+  log(`--- cycle at ${new Date().toISOString()} ---`, 'info');
+  try {
+    await runScanCycle();
+    await checkOpenSignals();
+    await maybeSendSummaries();
+  } catch (e) {
+    log('cycle error: ' + e.message, 'error');
+  }
+  if (running) setTimeout(cycle, CONFIG.LTF_GRANULARITY * 1000);
+}
+
+async function start() {
+  if (!CONFIG.TELEGRAM_BOT_TOKEN) {
+    const token = prompt('Enter your Telegram bot token:');
+    if (token) { CONFIG.TELEGRAM_BOT_TOKEN = token; localStorage.setItem('TELEGRAM_BOT_TOKEN', token); }
+  }
+  if (!CONFIG.TELEGRAM_CHAT_ID) {
+    const chatId = prompt('Enter your Telegram chat ID:');
+    if (chatId) { CONFIG.TELEGRAM_CHAT_ID = chatId; localStorage.setItem('TELEGRAM_CHAT_ID', chatId); }
+  }
+
+  running = true;
+  document.getElementById('statusBox').textContent = 'Running';
+  document.getElementById('statusBox').className = 'status running';
+  document.getElementById('startBtn').style.display = 'none';
+  document.getElementById('stopBtn').style.display = 'block';
+
+  await requestWakeLock();
+  const audio = document.getElementById('keepAliveAudio');
+  audio.volume = 0.01;
+  audio.play().catch(() => log('audio autoplay blocked (tap screen once to enable)', 'error'));
+
+  cycle();
+}
+
+function stop() {
+  running = false;
+  if (wakeLock) { wakeLock.release(); wakeLock = null; }
+  document.getElementById('keepAliveAudio').pause();
+  document.getElementById('statusBox').textContent = 'Stopped';
+  document.getElementById('statusBox').className = 'status stopped';
+  document.getElementById('startBtn').style.display = 'block';
+  document.getElementById('stopBtn').style.display = 'none';
+  log('stopped.', 'info');
+}
+
+document.getElementById('startBtn').addEventListener('click', start);
+document.getElementById('stopBtn').addEventListener('click', stop);
+
+log('Ready. Tap Start to begin scanning.', 'info');
+</script>
+</body>
+</html>
